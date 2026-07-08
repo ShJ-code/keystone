@@ -41,7 +41,7 @@ impl TryFrom<api_types::UserPassword>
             }
             upa.domain(domain_builder.build()?);
         }
-        upa.password(value.password.clone());
+        upa.password(value.password);
         upa.build()
     }
 }
@@ -69,7 +69,7 @@ impl TryFrom<api_types::TotpUser> for openstack_keystone_core_types::identity::U
             }
             uta.domain(domain_builder.build()?);
         }
-        uta.passcode(value.passcode.clone());
+        uta.passcode(value.passcode);
         uta.build()
     }
 }

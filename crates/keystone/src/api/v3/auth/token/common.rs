@@ -87,6 +87,7 @@ mod tests {
     use openstack_keystone_core_types::auth::*;
     use openstack_keystone_core_types::identity::{UserPasswordAuthRequest, UserResponseBuilder};
     use openstack_keystone_core_types::resource::Domain;
+    use secrecy::ExposeSecret;
 
     use super::super::types::*;
     use super::*;
@@ -116,7 +117,7 @@ mod tests {
             .expect_authenticate_by_password()
             .withf(|_, req: &UserPasswordAuthRequest| {
                 req.id == Some("uid".to_string())
-                    && req.password == "pwd"
+                    && req.password.expose_secret() == "pwd"
                     && req.name == Some("uname".to_string())
             })
             .returning(move |_, _| Ok(auth_clone.clone()));
@@ -174,7 +175,7 @@ mod tests {
         identity_mock
             .expect_authenticate_by_totp()
             .withf(|_, req: &UserTotpAuthRequest| {
-                req.id == Some("uid".to_string()) && req.passcode == "123456"
+                req.id == Some("uid".to_string()) && req.passcode.expose_secret() == "123456"
             })
             .returning(move |_, _| Ok(auth_clone.clone()));
 
@@ -249,8 +250,11 @@ mod tests {
         token_mock
             .expect_authorize_by_token()
             .withf(
-                |_, id: &'_ str, allow_expired: &Option<bool>, window: &Option<i64>| {
-                    id == "fake_token" && *allow_expired == Some(false) && window.is_none()
+                |_,
+                 _id: &secrecy::SecretString,
+                 allow_expired: &Option<bool>,
+                 window: &Option<i64>| {
+                    *allow_expired == Some(false) && window.is_none()
                 },
             )
             .returning(move |_state, _, _, _| Ok(vsc_clone.clone()));
@@ -276,7 +280,7 @@ mod tests {
                             methods: vec!["token".to_string()],
                             password: None,
                             token: Some(TokenAuth {
-                                id: "fake_token".to_string()
+                                id: "fake_token".into()
                             }),
                             totp: None,
                         },

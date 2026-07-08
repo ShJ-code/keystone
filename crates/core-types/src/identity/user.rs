@@ -15,11 +15,36 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use derive_builder::Builder;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::Value;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 use crate::error::BuilderError;
+
+fn validate_secret_length(secret: &SecretString, max: usize) -> Result<(), ValidationError> {
+    if secret.expose_secret().chars().count() <= max {
+        Ok(())
+    } else {
+        Err(ValidationError::new("length"))
+    }
+}
+
+fn validate_optional_secret_length(
+    secret: &Option<SecretString>,
+    max: usize,
+) -> Result<(), ValidationError> {
+    match secret {
+        Some(secret) => validate_secret_length(secret, max),
+        None => Ok(()),
+    }
+}
+
+// NOTE: password length/non-emptiness is not validated with a field-level
+// validator here — `SecretString` cannot use validator's `length` (no
+// `ValidateLength`) nor `custom` (which requires the field to be `Serialize`).
+// Non-emptiness is enforced centrally on the wrapped value at the service layer
+// via `security_compliance.validate_password`.
 
 #[derive(Builder, Clone, Debug, PartialEq, Serialize, Validate)]
 #[builder(build_fn(error = "BuilderError"))]
@@ -75,7 +100,11 @@ pub struct UserResponse {
 }
 
 /// User creation data.
-#[derive(Builder, Clone, Debug, PartialEq, Validate)]
+///
+/// `PartialEq` is intentionally not derived: `password` is wrapped in
+/// [`SecretString`], which does not implement `PartialEq` by design.
+#[derive(Builder, Clone, Debug, Validate)]
+#[validate(schema(function = "validate_user_create_secret"))]
 #[builder(build_fn(error = "BuilderError"))]
 #[builder(setter(strip_option, into))]
 pub struct UserCreate {
@@ -119,10 +148,10 @@ pub struct UserCreate {
     #[validate(nested)]
     pub options: Option<UserOptions>,
 
-    /// User password.
+    /// User password. Non-emptiness and regex policy are enforced at the
+    /// service layer via `security_compliance.validate_password`.
     #[builder(default)]
-    #[validate(length(max = 72))]
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
 
     /// The kind of local-authentication row to create for the user:
     /// `Local` creates a `local_user` row (password allowed), `NonLocal`
@@ -133,7 +162,20 @@ pub struct UserCreate {
     pub user_type: UserType,
 }
 
-#[derive(Builder, Clone, Debug, Default, PartialEq, Validate)]
+// NOTE: Struct-level (not field-level #[validate(custom)]) because validator
+// 0.20 serializes the failing field into ValidationError, which does not
+// compile for SecretString and would leak the secret; the derive still
+// validates all other fields.
+fn validate_user_create_secret(value: &UserCreate) -> Result<(), ValidationError> {
+    validate_optional_secret_length(&value.password, 72)
+}
+
+/// User update data.
+///
+/// `PartialEq` is intentionally not derived: `password` is wrapped in
+/// [`SecretString`], which does not implement `PartialEq` by design.
+#[derive(Builder, Clone, Debug, Default, Validate)]
+#[validate(schema(function = "validate_user_update_secret"))]
 #[builder(build_fn(error = "BuilderError"))]
 #[builder(setter(strip_option, into))]
 pub struct UserUpdate {
@@ -169,10 +211,18 @@ pub struct UserUpdate {
     #[validate(nested)]
     pub options: Option<UserOptions>,
 
-    /// New user password.
+    /// New user password. Non-emptiness/policy enforced at the service layer
+    /// via `security_compliance.validate_password`.
     #[builder(default)]
-    #[validate(length(max = 72))]
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
+}
+
+// NOTE: Struct-level (not field-level #[validate(custom)]) because validator
+// 0.20 serializes the failing field into ValidationError, which does not
+// compile for SecretString and would leak the secret; the derive still
+// validates all other fields.
+fn validate_user_update_secret(value: &UserUpdate) -> Result<(), ValidationError> {
+    validate_optional_secret_length(&value.password, 72)
 }
 
 /// User options.
@@ -279,7 +329,11 @@ pub enum UserType {
 }
 
 /// User password information.
-#[derive(Builder, Clone, Debug, Default, PartialEq, Validate)]
+///
+/// `Default` and `PartialEq` are intentionally not derived: `password` is a
+/// required [`SecretString`], which implements neither by design.
+#[derive(Builder, Clone, Debug, Validate)]
+#[validate(schema(function = "validate_user_password_auth_secret"))]
 #[builder(build_fn(error = "BuilderError"))]
 #[builder(setter(strip_option, into))]
 pub struct UserPasswordAuthRequest {
@@ -298,14 +352,42 @@ pub struct UserPasswordAuthRequest {
     #[validate(nested)]
     pub domain: Option<Domain>,
 
-    /// User password expiry date.
-    #[builder(default)]
-    #[validate(length(max = 72))]
-    pub password: String,
+    /// User password. Required (no builder default: `SecretString` does not
+    /// implement `Default`).
+    pub password: SecretString,
+}
+
+// NOTE: Struct-level (not field-level #[validate(custom)]) because validator
+// 0.20 serializes the failing field into ValidationError, which does not
+// compile for SecretString and would leak the secret; the derive still
+// validates all other fields.
+fn validate_user_password_auth_secret(
+    value: &UserPasswordAuthRequest,
+) -> Result<(), ValidationError> {
+    validate_secret_length(&value.password, 72)
+}
+
+/// Manual `Default` (the derive cannot be used because `SecretString` does not
+/// implement `Default`). Preserves the pre-wrapping default of an empty
+/// password. Production code constructs this via the builder, which requires an
+/// explicit password.
+impl Default for UserPasswordAuthRequest {
+    fn default() -> Self {
+        Self {
+            id: None,
+            name: None,
+            domain: None,
+            password: SecretString::from(""),
+        }
+    }
 }
 
 /// User TOTP authentication request.
-#[derive(Builder, Clone, Debug, Default, PartialEq, Validate)]
+///
+/// `PartialEq`/`Default` are intentionally not derived: `passcode` is a
+/// required [`SecretString`], which implements neither by design.
+#[derive(Builder, Clone, Debug, Validate)]
+#[validate(schema(function = "validate_user_totp_auth_secret"))]
 #[builder(build_fn(error = "BuilderError"))]
 #[builder(setter(strip_option, into))]
 pub struct UserTotpAuthRequest {
@@ -325,9 +407,15 @@ pub struct UserTotpAuthRequest {
     pub domain: Option<Domain>,
 
     /// The passcode generated by the user's TOTP device/app.
-    #[builder(default)]
-    #[validate(length(max = 32))]
-    pub passcode: String,
+    pub passcode: SecretString,
+}
+
+// NOTE: Struct-level (not field-level #[validate(custom)]) because validator
+// 0.20 serializes the failing field into ValidationError, which does not
+// compile for SecretString and would leak the secret; the derive still
+// validates all other fields.
+fn validate_user_totp_auth_secret(value: &UserTotpAuthRequest) -> Result<(), ValidationError> {
+    validate_secret_length(&value.passcode, 32)
 }
 
 /// Domain information.

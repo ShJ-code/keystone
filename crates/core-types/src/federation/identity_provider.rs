@@ -14,13 +14,14 @@
 //! # Federated identity provider types
 
 use derive_builder::Builder;
+use secrecy::SecretString;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::BuilderError;
 
 /// Identity provider resource.
-#[derive(Builder, Clone, Debug, Default, Serialize, PartialEq)]
+#[derive(Builder, Clone, Debug, Default, Serialize)]
 #[builder(build_fn(error = "BuilderError"))]
 #[builder(setter(strip_option, into))]
 pub struct IdentityProvider {
@@ -45,8 +46,11 @@ pub struct IdentityProvider {
     #[builder(default)]
     pub oidc_client_id: Option<String>,
 
+    /// The OIDC client secret. It is never returned back, so it is skipped on
+    /// serialization; `SecretString` additionally keeps it out of `Debug`.
     #[builder(default)]
-    pub oidc_client_secret: Option<String>,
+    #[serde(skip_serializing)]
+    pub oidc_client_secret: Option<SecretString>,
 
     #[builder(default)]
     pub oidc_response_mode: Option<String>,
@@ -82,7 +86,7 @@ pub struct IdentityProvider {
 }
 
 /// New Identity provider data.
-#[derive(Builder, Clone, Debug, Default, PartialEq)]
+#[derive(Builder, Clone, Debug, Default)]
 #[builder(build_fn(error = "BuilderError"))]
 #[builder(setter(strip_option, into))]
 pub struct IdentityProviderCreate {
@@ -107,8 +111,9 @@ pub struct IdentityProviderCreate {
     #[builder(default)]
     pub oidc_client_id: Option<String>,
 
+    /// The OIDC client secret.
     #[builder(default)]
-    pub oidc_client_secret: Option<String>,
+    pub oidc_client_secret: Option<SecretString>,
 
     #[builder(default)]
     pub oidc_response_mode: Option<String>,
@@ -141,7 +146,7 @@ pub struct IdentityProviderCreate {
 }
 
 /// Identity provider update data.
-#[derive(Builder, Clone, Debug, Default, PartialEq)]
+#[derive(Builder, Clone, Debug, Default)]
 #[builder(build_fn(error = "BuilderError"))]
 #[builder(setter(into))]
 pub struct IdentityProviderUpdate {
@@ -157,8 +162,10 @@ pub struct IdentityProviderUpdate {
     #[builder(default)]
     pub oidc_client_id: Option<Option<String>>,
 
+    /// The OIDC client secret. Outer `Option` = present-in-request, inner
+    /// `Option` = set-or-clear.
     #[builder(default)]
-    pub oidc_client_secret: Option<Option<String>>,
+    pub oidc_client_secret: Option<Option<SecretString>>,
 
     #[builder(default)]
     pub oidc_response_mode: Option<Option<String>>,
@@ -210,4 +217,42 @@ pub struct IdentityProviderListParameters {
     ///
     /// Filters the response by IDP name.
     pub name: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "oidc-top-secret";
+
+    #[test]
+    fn identity_provider_debug_does_not_leak_client_secret() {
+        let idp = IdentityProviderBuilder::default()
+            .id("1")
+            .name("idp")
+            .oidc_client_secret(SecretString::from(SECRET))
+            .build()
+            .unwrap();
+
+        // Debug (the #[instrument] / log vector) must not leak the secret.
+        assert!(
+            !format!("{idp:?}").contains(SECRET),
+            "Debug leaked client secret"
+        );
+    }
+
+    #[test]
+    fn identity_provider_does_not_serialize_client_secret() {
+        let idp = IdentityProviderBuilder::default()
+            .id("1")
+            .name("idp")
+            .oidc_client_secret(SecretString::from(SECRET))
+            .build()
+            .unwrap();
+
+        // The secret is never returned back, so it must not appear on the wire.
+        let json = serde_json::to_string(&idp).unwrap();
+        assert!(!json.contains(SECRET), "serialize leaked client secret");
+        assert!(!json.contains("oidc_client_secret"));
+    }
 }

@@ -230,6 +230,7 @@ async fn should_lock(
 mod tests {
     use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Transaction};
+    use secrecy::SecretString;
     use tracing_test::traced_test;
 
     use openstack_keystone_core_types::identity::UserOptions;
@@ -452,9 +453,10 @@ mod tests {
     async fn test_authenticate() {
         let config = Config::default();
         let password = String::from("pass");
+        let password_secret = SecretString::from(password.clone());
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![get_local_user_with_password_mock(
-                password_hashing::hash_password(&config, &password)
+                password_hashing::hash_password(&config, &password_secret)
                     .await
                     .unwrap(),
             )]])
@@ -473,7 +475,7 @@ mod tests {
                 &db,
                 &UserPasswordAuthRequest {
                     id: Some("user_id".into()),
-                    password,
+                    password: password.clone().into(),
                     ..Default::default()
                 },
             )
@@ -588,7 +590,7 @@ mod tests {
                 db_password::ModelBuilder::default()
                     .local_user_id(1)
                     .password_hash(
-                        password_hashing::hash_password(&config, &password)
+                        password_hashing::hash_password(&config, &SecretString::from(password))
                             .await
                             .unwrap(),
                     )
@@ -853,12 +855,13 @@ mod tests {
     async fn test_authenticate_expired_password() {
         let config = Config::default();
         let password = String::from("foo_pass");
+        let password_secret = SecretString::from(password.clone());
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![(
                 get_local_user_mock("user_id"),
                 db_password::ModelBuilder::default()
                     .password_hash(
-                        password_hashing::hash_password(&config, &password)
+                        password_hashing::hash_password(&config, &password_secret)
                             .await
                             .unwrap(),
                     )
@@ -877,7 +880,7 @@ mod tests {
             &db,
             &UserPasswordAuthRequest {
                 id: Some("user_id".into()),
-                password: password.clone(),
+                password: password.clone().into(),
                 ..Default::default()
             },
         )
@@ -899,12 +902,13 @@ mod tests {
     async fn test_authenticate_exempt_expired_password() {
         let config = Config::default();
         let password = String::from("foo_pass");
+        let password_secret = SecretString::from(password.clone());
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![(
                 get_local_user_mock("user_id"),
                 db_password::ModelBuilder::expired()
                     .password_hash(
-                        password_hashing::hash_password(&config, &password)
+                        password_hashing::hash_password(&config, &password_secret)
                             .await
                             .unwrap(),
                     )
@@ -927,7 +931,7 @@ mod tests {
                 &db,
                 &UserPasswordAuthRequest {
                     id: Some("user_id".into()),
-                    password: password.clone(),
+                    password: password.clone().into(),
                     ..Default::default()
                 },
             )

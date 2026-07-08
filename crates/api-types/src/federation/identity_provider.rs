@@ -12,6 +12,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //! Federated identity provider types.
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(feature = "validate")]
@@ -122,7 +123,7 @@ pub struct IdentityProviderResponse {
 }
 
 /// Identity provider data.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(
     feature = "builder",
     derive(derive_builder::Builder),
@@ -133,6 +134,10 @@ pub struct IdentityProviderResponse {
 )]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "validate", derive(validator::Validate))]
+#[cfg_attr(
+    feature = "validate",
+    validate(schema(function = "validate_identity_provider_create_secret"))
+)]
 pub struct IdentityProviderCreate {
     // TODO: add ID
     /// Identity provider name.
@@ -171,10 +176,13 @@ pub struct IdentityProviderCreate {
     /// The oidc `client_secret` to use for the private client. It is never
     /// returned back.
     #[cfg_attr(feature = "builder", builder(default))]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "validate", validate(length(max = 255)))]
-    pub oidc_client_secret: Option<String>,
+    #[cfg_attr(feature = "openapi", schema(value_type = String, nullable = false))]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::common::serialize_optional_secret"
+    )]
+    pub oidc_client_secret: Option<SecretString>,
 
     /// The oidc response mode.
     #[cfg_attr(feature = "builder", builder(default))]
@@ -239,8 +247,30 @@ pub struct IdentityProviderCreate {
     pub provider_config: Option<Value>,
 }
 
+impl IdentityProviderCreate {
+    #[must_use]
+    pub fn to_policy_input(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        if let Some(input) = value.as_object_mut() {
+            input.remove("oidc_client_secret");
+        }
+        value
+    }
+}
+
+#[cfg(feature = "validate")]
+// NOTE: Struct-level (not field-level #[validate(custom)]) because validator
+// 0.20 serializes the failing field into ValidationError, which does not
+// compile for SecretString and would leak the secret; the derive still
+// validates all other fields.
+fn validate_identity_provider_create_secret(
+    value: &IdentityProviderCreate,
+) -> Result<(), validator::ValidationError> {
+    crate::common::validate_optional_secret_length(&value.oidc_client_secret, 255)
+}
+
 /// New identity provider data.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(
     feature = "builder",
     derive(derive_builder::Builder),
@@ -251,6 +281,10 @@ pub struct IdentityProviderCreate {
 )]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "validate", derive(validator::Validate))]
+#[cfg_attr(
+    feature = "validate",
+    validate(schema(function = "validate_identity_provider_update_secret"))
+)]
 pub struct IdentityProviderUpdate {
     /// The new name of the federated identity provider.
     #[cfg_attr(feature = "validate", validate(length(max = 255)))]
@@ -273,8 +307,12 @@ pub struct IdentityProviderUpdate {
 
     /// The new oidc `client_secret` to use for the private client.
     #[cfg_attr(feature = "builder", builder(default))]
-    #[cfg_attr(feature = "validate", validate(length(max = 255)))]
-    pub oidc_client_secret: Option<Option<String>>,
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>))]
+    #[serde(
+        default,
+        serialize_with = "crate::common::serialize_nested_optional_secret"
+    )]
+    pub oidc_client_secret: Option<Option<SecretString>>,
 
     /// The new oidc response mode.
     #[cfg_attr(feature = "builder", builder(default))]
@@ -323,8 +361,30 @@ pub struct IdentityProviderUpdate {
     pub provider_config: Option<Option<Value>>,
 }
 
+impl IdentityProviderUpdate {
+    #[must_use]
+    pub fn to_policy_input(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        if let Some(input) = value.as_object_mut() {
+            input.remove("oidc_client_secret");
+        }
+        value
+    }
+}
+
+#[cfg(feature = "validate")]
+// NOTE: Struct-level (not field-level #[validate(custom)]) because validator
+// 0.20 serializes the failing field into ValidationError, which does not
+// compile for SecretString and would leak the secret; the derive still
+// validates all other fields.
+fn validate_identity_provider_update_secret(
+    value: &IdentityProviderUpdate,
+) -> Result<(), validator::ValidationError> {
+    crate::common::validate_nested_optional_secret_length(&value.oidc_client_secret, 255)
+}
+
 /// Identity provider create request.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "validate", derive(validator::Validate))]
 pub struct IdentityProviderCreateRequest {
@@ -334,7 +394,7 @@ pub struct IdentityProviderCreateRequest {
 }
 
 /// Identity provider update request.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "validate", derive(validator::Validate))]
 pub struct IdentityProviderUpdateRequest {
@@ -382,4 +442,98 @@ pub struct IdentityProviderListParameters {
 
 fn default_list_limit() -> Option<u64> {
     Some(20)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The client secret must never leak through the DTO's `Debug` (the tracing
+    /// / logging vector), while remaining available via `expose_secret` for the
+    /// storage write.
+    #[test]
+    fn idp_create_debug_does_not_leak_client_secret() {
+        use secrecy::ExposeSecret;
+        let create: IdentityProviderCreate =
+            serde_json::from_str(r#"{"name":"idp","oidc_client_secret":"CSLEAK"}"#).unwrap();
+        assert!(
+            !format!("{create:?}").contains("CSLEAK"),
+            "Debug leaked client secret: {create:?}"
+        );
+        assert_eq!(
+            create
+                .oidc_client_secret
+                .as_ref()
+                .map(|s| s.expose_secret()),
+            Some("CSLEAK")
+        );
+    }
+
+    /// Same for the update DTO (nested `Option<Option<SecretString>>`).
+    #[test]
+    fn idp_update_debug_does_not_leak_client_secret() {
+        let update: IdentityProviderUpdate =
+            serde_json::from_str(r#"{"oidc_client_secret":"CSLEAK2"}"#).unwrap();
+        assert!(
+            !format!("{update:?}").contains("CSLEAK2"),
+            "Debug leaked client secret: {update:?}"
+        );
+    }
+
+    #[test]
+    fn idp_policy_input_omits_client_secret() {
+        let create: IdentityProviderCreate =
+            serde_json::from_str(r#"{"name":"idp","oidc_client_secret":"CSLEAK"}"#).unwrap();
+        let input = create.to_policy_input();
+        let rendered = input.to_string();
+        assert!(
+            !rendered.contains("CSLEAK"),
+            "policy input leaked client secret: {rendered}"
+        );
+        assert!(input.get("oidc_client_secret").is_none());
+        assert_eq!(input.get("name").and_then(|v| v.as_str()), Some("idp"));
+
+        let update: IdentityProviderUpdate =
+            serde_json::from_str(r#"{"oidc_client_secret":"CSLEAK2"}"#).unwrap();
+        let input = update.to_policy_input();
+        let rendered = input.to_string();
+        assert!(
+            !rendered.contains("CSLEAK2"),
+            "policy input leaked client secret: {rendered}"
+        );
+        assert!(input.get("oidc_client_secret").is_none());
+        assert!(input.get("oidc_client_id").is_some());
+    }
+
+    /// Regression guard: the read/response DTO has no client-secret field, so a
+    /// client secret can never be returned — even if one is (wrongly) supplied.
+    #[test]
+    fn identity_provider_response_never_exposes_client_secret() {
+        let idp: IdentityProvider = serde_json::from_str(
+            r#"{"id":"1","name":"idp","enabled":true,
+                "oidc_client_secret":"SHOULD_BE_IGNORED"}"#,
+        )
+        .unwrap();
+        let rendered = serde_json::to_string(&idp).unwrap();
+        assert!(
+            !rendered.contains("client_secret"),
+            "response exposed a client_secret field: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SHOULD_BE_IGNORED"),
+            "response leaked the secret value: {rendered}"
+        );
+    }
+
+    #[cfg(feature = "validate")]
+    #[test]
+    fn idp_update_validates_overlong_client_secret() {
+        let update: IdentityProviderUpdate = serde_json::from_str(&format!(
+            r#"{{"oidc_client_secret":"{}"}}"#,
+            "x".repeat(256)
+        ))
+        .unwrap();
+
+        assert!(update.validate().is_err());
+    }
 }

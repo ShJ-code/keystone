@@ -12,34 +12,149 @@
 //! for the `wasm32-unknown-unknown` target (`rustup target add
 //! wasm32-unknown-unknown`, then `cargo build --release --target
 //! wasm32-unknown-unknown`).
-use extism_pdk::{plugin_fn, FnResult, Json};
+use extism_pdk::{FnResult, Json, host_fn, plugin_fn};
 use serde::{Deserialize, Serialize};
 
+// Host functions §6 A-D (ADR 0025 Phase 1, PR 1.1). Declared as raw
+// `String` in/out (JSON text) rather than `Json<T>` here so this guest
+// never needs to depend on the host's own request/response types - it just
+// forwards/parses JSON text, exactly as a genuinely third-party plugin
+// author would since they can't import the host's Rust structs either.
+#[host_fn]
+extern "ExtismHost" {
+    fn provision_user(request_json: String) -> String;
+    fn find_user(external_id_json: String) -> String;
+    fn assign_role(request_json: String) -> String;
+    fn http_fetch(request_json: String) -> String;
+}
+
+/// Test-only entry point (not part of the ADR's guest contract) proving the
+/// `provision_user` host function is reachable and round-trips JSON
+/// correctly when this plugin's config grants the `provision_user`
+/// capability.
+#[plugin_fn]
+pub fn call_provision_user(request_json: String) -> FnResult<String> {
+    let handle = unsafe { provision_user(request_json)? };
+    Ok(handle)
+}
+
+/// Test-only entry point mirroring [`call_provision_user`] for `find_user`.
+#[plugin_fn]
+pub fn call_find_user(external_id_json: String) -> FnResult<String> {
+    let handle = unsafe { find_user(external_id_json)? };
+    Ok(handle)
+}
+
+/// Test-only entry point mirroring [`call_provision_user`] for
+/// `assign_role`.
+#[plugin_fn]
+pub fn call_assign_role(request_json: String) -> FnResult<String> {
+    let result = unsafe { assign_role(request_json)? };
+    Ok(result)
+}
+
+/// Test-only entry point mirroring [`call_provision_user`] for
+/// `http_fetch`.
+#[plugin_fn]
+pub fn call_http_fetch(request_json: String) -> FnResult<String> {
+    let result = unsafe { http_fetch(request_json)? };
+    Ok(result)
+}
+
+// `AuthPluginRequest`/`AuthPluginResponse` mirror
+// `openstack_keystone_dynamic_plugin_runtime::auth_contract`'s wire shape
+// (ADR 0025 §4 "Guest Contract - full_auth Mode") - defined locally rather
+// than imported, keeping this fixture crate dependency-free from
+// `dynamic-plugin-runtime`'s Rust types, exactly as a genuinely third-party
+// plugin author (who cannot import the host's Rust structs) would have to.
+
 #[derive(Debug, Deserialize)]
-pub struct AuthRequest {
+pub struct AuthPluginRequest {
+    pub payload: AuthPayload,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub remote_addr: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthPayload {
     pub external_id: String,
     #[serde(default)]
     pub deny: bool,
+    /// Defaults to the domain this fixture's own `[dynamic_plugin.p]`
+    /// config grants in tests (`provision_domain_id = d`).
+    #[serde(default = "default_domain_id")]
+    pub domain_id: String,
+    /// Test-only hook: skip the real `provision_user` call and return a
+    /// self-fabricated `resolved_identity` instead - simulates a
+    /// compromised/buggy plugin trying to hand back a handle it was never
+    /// actually issued, proving the host's identity-binding verification
+    /// (ADR §4 step 3) rejects it rather than trusting it.
+    #[serde(default)]
+    pub bad_handle: bool,
+}
+
+fn default_domain_id() -> String {
+    "d".to_string()
 }
 
 #[derive(Debug, Serialize)]
-pub struct AuthResponse {
-    pub decision: &'static str,
-    pub external_id: String,
+#[serde(rename_all = "snake_case", tag = "decision")]
+pub enum AuthPluginResponse {
+    Allow {
+        resolved_identity: String,
+        claims: std::collections::HashMap<String, serde_json::Value>,
+    },
+    Deny {
+        reason: String,
+    },
 }
 
-/// Stand-in for the eventual `authenticate` guest entry point (`full_auth`
-/// mode). Allows unless the caller asks to be denied, echoing back the
-/// external id it was given - just enough behavior for Phase 0 tests to
-/// prove a real Rust-compiled `.wasm` module loads and round-trips JSON
-/// through Extism.
+/// `full_auth` mode's `authenticate` guest entry point (ADR 0025 §4). Denies
+/// if the caller asked to be denied; otherwise calls the host's
+/// `provision_user` (idempotent - a repeat call with the same `external_id`
+/// resolves the same identity, PR 1.1) and returns the resulting handle,
+/// with a small claim proving the plugin's own claims-namespacing
+/// (`plugin_claims.<plugin_name>.*`) round-trips end to end.
 #[plugin_fn]
-pub fn authenticate(req: Json<AuthRequest>) -> FnResult<Json<AuthResponse>> {
-    let req = req.0;
-    let decision = if req.deny { "deny" } else { "allow" };
-    Ok(Json(AuthResponse {
-        decision,
-        external_id: req.external_id,
+pub fn authenticate(req: Json<AuthPluginRequest>) -> FnResult<Json<AuthPluginResponse>> {
+    let payload = req.0.payload;
+    if payload.deny {
+        return Ok(Json(AuthPluginResponse::Deny {
+            reason: "reference-plugin: deny requested".to_string(),
+        }));
+    }
+    if payload.bad_handle {
+        return Ok(Json(AuthPluginResponse::Allow {
+            resolved_identity: "forged-handle-never-issued-by-the-host".to_string(),
+            claims: std::collections::HashMap::new(),
+        }));
+    }
+
+    let provision_request = serde_json::json!({
+        "external_id": payload.external_id,
+        "user": {
+            "domain_id": payload.domain_id,
+            "name": payload.external_id,
+            "enabled": true,
+            "extra": {},
+        },
+    });
+    let handle_json = unsafe { provision_user(provision_request.to_string())? };
+    let resolved_identity: String = serde_json::from_str(&handle_json)?;
+
+    let mut claims = std::collections::HashMap::new();
+    claims.insert(
+        "source".to_string(),
+        serde_json::Value::String("reference-plugin".to_string()),
+    );
+
+    Ok(Json(AuthPluginResponse::Allow {
+        resolved_identity,
+        claims,
     }))
 }
 

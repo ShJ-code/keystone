@@ -126,6 +126,14 @@ jobs:
         with:
           version: latest
 
+      # Runs here unconditionally (not only in policy-container.yml, which is
+      # gated on `paths: policy/**`) so a Rust-only PR that changes which
+      # policy_name a handler enforces, or reshapes the Credentials
+      # projection, is also gated by the Rego test suite. See security review
+      # V3 / Gate A (doc/src/security-architecture-review.md).
+      - name: Test OPA policies
+        run: opa test policy
+
       - name: Rust Cache
         uses: swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
 
@@ -208,6 +216,49 @@ jobs:
           name: Cargo Nextest Results
           path: target/nextest/*/junit.xml
           reporter: java-junit
+
+  # Gate B1 (security review V3 / issue #977): runs unconditionally, not
+  # gated on path filters, so it catches a Rust change that renames/drops an
+  # enforce() call, or a policy change that leaves a handler's enforce()
+  # target dangling, no matter which side of the split it touches.
+  policy-handler-coverage:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Check policy<->handler existence (Gate B1)
+        run: python3 tools/check_policy_handler_coverage.py
+
+      # Gate E (security review V3 / issue #985): security.md I2's
+      # undefined-argument footgun -- a delegation-boundary helper called
+      # with a bare dotted path instead of object.get(..., null).
+      - name: Check Rego undefined-argument footgun (Gate E)
+        run: python3 tools/check_rego_undefined_argument_footgun.py
+
+      # Gate J (security review V1/V2 / issue #986): the mechanically
+      # checkable subset of the security.md §7 reviewer checklist.
+      - name: Check security.md §7 checklist SAST (Gate J)
+        run: python3 tools/check_security_checklist_sast.py
+
+      # Gate I companion (security review V9 / issue #987): EventPayload
+      # (the ADR 0023 audit-trail projection) must never grow a
+      # secret-shaped field; crates/core/src/policy.rs and the
+      # credential/os_ec2 policy-input helpers carry the equivalent
+      # assertion as Rust unit tests (cargo test already gates those).
+      - name: Check EventPayload has no secret fields (Gate I)
+        run: python3 tools/check_event_payload_no_secret_fields.py
+
+      # Gate C (security review V1/V2 / issue #982): every
+      # delegation-sensitive policy's test suite must carry a scope-drift
+      # negative case (security.md I3), not just a wrong-project case.
+      - name: Check delegated-policy scope-drift test presence (Gate C)
+        run: python3 tools/check_delegated_policy_scope_drift_tests.py
 
   openapi:
     needs: changes

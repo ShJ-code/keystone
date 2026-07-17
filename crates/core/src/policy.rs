@@ -353,7 +353,21 @@ impl TryFrom<&ValidatedSecurityContext> for Credentials {
                     claims.clone(),
                 )]));
             }
-            _ => {}
+            // Not delegated (or, for WasmPlugin, delegated but carrying no
+            // claims) -- nothing extra to project. Named explicitly, not a
+            // wildcard, so a new AuthenticationContext variant is a compile
+            // error here until a human decides how it fits (security.md
+            // V2 / Gate J, issue #986).
+            AuthenticationContext::WasmPlugin { .. }
+            | AuthenticationContext::Oidc { .. }
+            | AuthenticationContext::K8s(_)
+            | AuthenticationContext::Password
+            | AuthenticationContext::Admin
+            | AuthenticationContext::Token(_)
+            | AuthenticationContext::WebauthN
+            | AuthenticationContext::Mapping(_)
+            | AuthenticationContext::Ec2Credential
+            | AuthenticationContext::Totp => {}
         }
         if let Some(authz) = sc.authorization() {
             match &authz.scope {
@@ -528,6 +542,7 @@ impl PolicyEvaluationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::policy_contract;
     use crate::api::tests::test_fixture_scoped;
     use openstack_keystone_core_types::role::RoleRef;
 
@@ -598,5 +613,352 @@ mod tests {
         assert_eq!(creds.domain_id.as_deref(), Some("domain_id"));
         assert_eq!(creds.project_domain_id, None);
         assert_eq!(creds.project_id, None);
+    }
+
+    /// Gate I (security review V9, issue #987): a structural test that
+    /// `Credentials` -- the auth-chain projection sent to OPA on every
+    /// request -- never serializes a secret-bearing field, regardless of
+    /// which fields are populated. Currently vacuous (no field on
+    /// `Credentials` carries decrypted secret material today), but that is
+    /// exactly the point: it exists to catch a *future* field addition
+    /// that reintroduces one, the way `credential_policy_input`'s `blob`
+    /// stripping guards the sibling `target`/`existing` half of the
+    /// policy-input document (Gate B2).
+    #[test]
+    fn test_credentials_serialization_never_leaks_secrets() {
+        let creds = CredentialsBuilder::default()
+            .is_admin(false)
+            .user_id("uid")
+            .roles(vec!["member".to_string()])
+            .project_id("pid".to_string())
+            .auth_type("trust")
+            .is_delegated(true)
+            .unrestricted(false)
+            .delegated_project_id("pid".to_string())
+            .trust(Trust {
+                id: "t1".to_string(),
+                trustor_user_id: "trustor".to_string(),
+                trustee_user_id: "trustee".to_string(),
+                impersonation: false,
+                project_id: Some("pid".to_string()),
+                expires_at: None,
+                deleted_at: None,
+                extra: None,
+                remaining_uses: None,
+                redelegated_trust_id: None,
+                redelegation_count: None,
+                roles: Some(vec![]),
+            })
+            .plugin_claims(std::collections::HashMap::from([(
+                "acme_sso".to_string(),
+                std::collections::HashMap::from([(
+                    "department".to_string(),
+                    serde_json::json!("engineering"),
+                )]),
+            )]))
+            .build()
+            .unwrap();
+
+        let value = serde_json::to_value(&creds).unwrap();
+        policy_contract::assert_no_secrets(&value);
+    }
+
+    fn vsc_with_ctx_and_project(
+        auth_ctx: AuthenticationContext,
+        project_id: &str,
+    ) -> ValidatedSecurityContext {
+        let user = openstack_keystone_core_types::identity::UserResponseBuilder::default()
+            .id("uid")
+            .domain_id("domain_id")
+            .enabled(true)
+            .name("testuser")
+            .build()
+            .unwrap();
+        let authz = AuthzInfoBuilder::default()
+            .roles(vec![RoleRef {
+                id: "admin".to_string(),
+                name: Some("admin".to_string()),
+                domain_id: None,
+            }])
+            .scope(ScopeInfo::Project {
+                project: openstack_keystone_core_types::resource::Project {
+                    id: project_id.to_string(),
+                    domain_id: "domain_id".to_string(),
+                    enabled: true,
+                    name: "proj".to_string(),
+                    ..Default::default()
+                },
+                project_domain: openstack_keystone_core_types::resource::Domain {
+                    id: "domain_id".to_string(),
+                    name: "domain_name".to_string(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            })
+            .build()
+            .unwrap();
+        let sc = SecurityContext::test_build()
+            .authentication_context(auth_ctx)
+            .principal(PrincipalInfo {
+                identity: IdentityInfo::User(
+                    UserIdentityInfoBuilder::default()
+                        .user_id("uid")
+                        .user(user)
+                        .user_domain(openstack_keystone_core_types::resource::Domain {
+                            id: "domain_id".to_string(),
+                            name: "domain_name".to_string(),
+                            enabled: true,
+                            ..Default::default()
+                        })
+                        .build()
+                        .unwrap(),
+                ),
+            })
+            .authorization(authz)
+            .build();
+        ValidatedSecurityContext::test_new(sc)
+    }
+
+    fn make_ac(
+        project_id: &str,
+        unrestricted: bool,
+    ) -> openstack_keystone_core_types::application_credential::ApplicationCredential {
+        openstack_keystone_core_types::application_credential::ApplicationCredential {
+            id: "ac1".to_string(),
+            user_id: "uid".to_string(),
+            project_id: project_id.to_string(),
+            name: "cred".to_string(),
+            description: None,
+            roles: vec![],
+            unrestricted,
+            expires_at: None,
+            access_rules: None,
+        }
+    }
+
+    fn make_trust_ctx(project_id: Option<&str>) -> Trust {
+        Trust {
+            id: "t1".to_string(),
+            trustor_user_id: "trustor".to_string(),
+            trustee_user_id: "uid".to_string(),
+            impersonation: false,
+            project_id: project_id.map(|s| s.to_string()),
+            expires_at: None,
+            deleted_at: None,
+            extra: None,
+            remaining_uses: None,
+            redelegated_trust_id: None,
+            redelegation_count: None,
+            roles: Some(vec![]),
+        }
+    }
+
+    /// Application-credential delegation facts (project + unrestricted flag)
+    /// must land on `Credentials` from the auth chain. Catches deletion of
+    /// the `ApplicationCredential` match arm in
+    /// `TryFrom<&ValidatedSecurityContext>`.
+    #[test]
+    fn credentials_from_application_credential_carries_delegation_facts() {
+        let vsc = vsc_with_ctx_and_project(
+            AuthenticationContext::ApplicationCredential {
+                application_credential: make_ac("project_id", true),
+                token: None,
+            },
+            "project_id",
+        );
+        let creds = Credentials::try_from(&vsc).unwrap();
+        assert_eq!(creds.delegated_project_id.as_deref(), Some("project_id"));
+        assert_eq!(creds.unrestricted, Some(true));
+        assert!(creds.is_delegated);
+    }
+
+    /// Trust delegation facts (project + trust object) must land on
+    /// `Credentials`. Catches deletion of the `Trust` match arm.
+    #[test]
+    fn credentials_from_trust_carries_delegation_facts() {
+        let vsc = vsc_with_ctx_and_project(
+            AuthenticationContext::Trust {
+                trust: make_trust_ctx(Some("project_id")),
+                token: None,
+            },
+            "project_id",
+        );
+        let creds = Credentials::try_from(&vsc).unwrap();
+        assert_eq!(creds.delegated_project_id.as_deref(), Some("project_id"));
+        assert!(creds.trust.is_some());
+        assert!(creds.is_delegated);
+    }
+
+    /// A trust with no bound project must not fabricate a
+    /// `delegated_project_id`.
+    #[test]
+    fn credentials_from_trust_without_project_leaves_delegated_project_id_unset() {
+        let vsc = vsc_with_ctx_and_project(
+            AuthenticationContext::Trust {
+                trust: make_trust_ctx(None),
+                token: None,
+            },
+            "project_id",
+        );
+        let creds = Credentials::try_from(&vsc).unwrap();
+        assert_eq!(creds.delegated_project_id, None);
+    }
+
+    /// Non-delegated auth methods must not populate `unrestricted` or
+    /// `delegated_project_id`.
+    #[test]
+    fn credentials_from_password_has_no_delegation_facts() {
+        let vsc = vsc_with_ctx_and_project(AuthenticationContext::Password, "project_id");
+        let creds = Credentials::try_from(&vsc).unwrap();
+        assert_eq!(creds.delegated_project_id, None);
+        assert_eq!(creds.unrestricted, None);
+        assert!(!creds.is_delegated);
+    }
+
+    /// The system-scope alias: the literal `"system"` scope value must map
+    /// to `"all"`, while any other named system scope passes through
+    /// unchanged. Catches `==` -> `!=` on the alias check.
+    #[test]
+    fn credentials_system_scope_all_alias() {
+        let authz = AuthzInfoBuilder::default()
+            .roles(vec![])
+            .scope(ScopeInfo::System("system".to_string()))
+            .build()
+            .unwrap();
+        let sc = SecurityContext::test_build()
+            .authentication_context(AuthenticationContext::Password)
+            .principal(PrincipalInfo {
+                identity: IdentityInfo::User(
+                    UserIdentityInfoBuilder::default()
+                        .user_id("uid")
+                        .user(
+                            openstack_keystone_core_types::identity::UserResponseBuilder::default()
+                                .id("uid")
+                                .domain_id("domain_id")
+                                .enabled(true)
+                                .name("testuser")
+                                .build()
+                                .unwrap(),
+                        )
+                        .user_domain(openstack_keystone_core_types::resource::Domain {
+                            id: "domain_id".to_string(),
+                            name: "domain_name".to_string(),
+                            enabled: true,
+                            ..Default::default()
+                        })
+                        .build()
+                        .unwrap(),
+                ),
+            })
+            .authorization(authz)
+            .build();
+        let vsc = ValidatedSecurityContext::test_new(sc);
+        let creds = Credentials::try_from(&vsc).unwrap();
+        assert_eq!(creds.system.as_deref(), Some("all"));
+    }
+
+    #[test]
+    fn credentials_system_scope_named_passes_through() {
+        let authz = AuthzInfoBuilder::default()
+            .roles(vec![])
+            .scope(ScopeInfo::System("other_system".to_string()))
+            .build()
+            .unwrap();
+        let sc = SecurityContext::test_build()
+            .authentication_context(AuthenticationContext::Password)
+            .principal(PrincipalInfo {
+                identity: IdentityInfo::User(
+                    UserIdentityInfoBuilder::default()
+                        .user_id("uid")
+                        .user(
+                            openstack_keystone_core_types::identity::UserResponseBuilder::default()
+                                .id("uid")
+                                .domain_id("domain_id")
+                                .enabled(true)
+                                .name("testuser")
+                                .build()
+                                .unwrap(),
+                        )
+                        .user_domain(openstack_keystone_core_types::resource::Domain {
+                            id: "domain_id".to_string(),
+                            name: "domain_name".to_string(),
+                            enabled: true,
+                            ..Default::default()
+                        })
+                        .build()
+                        .unwrap(),
+                ),
+            })
+            .authorization(authz)
+            .build();
+        let vsc = ValidatedSecurityContext::test_new(sc);
+        let creds = Credentials::try_from(&vsc).unwrap();
+        assert_eq!(creds.system.as_deref(), Some("other_system"));
+    }
+
+    /// A `WasmPlugin` context with claims must project them into
+    /// `plugin_claims`, keyed by plugin name. Catches the `!claims.is_empty()`
+    /// guard being flipped or deleted.
+    #[test]
+    fn credentials_from_wasm_plugin_with_claims_populates_plugin_claims() {
+        let mut claims = std::collections::HashMap::new();
+        claims.insert("department".to_string(), serde_json::json!("engineering"));
+        let vsc = vsc_with_ctx_and_project(
+            AuthenticationContext::WasmPlugin {
+                plugin_name: "acme_sso".to_string(),
+                claims,
+                token: None,
+            },
+            "project_id",
+        );
+        let creds = Credentials::try_from(&vsc).unwrap();
+        let plugin_claims = creds.plugin_claims.expect("plugin_claims must be set");
+        assert!(plugin_claims.contains_key("acme_sso"));
+    }
+
+    /// A `WasmPlugin` context with no claims must leave `plugin_claims`
+    /// unset (not an empty map keyed by plugin name).
+    #[test]
+    fn credentials_from_wasm_plugin_without_claims_leaves_plugin_claims_unset() {
+        let vsc = vsc_with_ctx_and_project(
+            AuthenticationContext::WasmPlugin {
+                plugin_name: "acme_sso".to_string(),
+                claims: std::collections::HashMap::new(),
+                token: None,
+            },
+            "project_id",
+        );
+        let creds = Credentials::try_from(&vsc).unwrap();
+        assert_eq!(creds.plugin_claims, None);
+    }
+
+    /// Scope-drift tripwire (I3): a delegated caller whose token scope no
+    /// longer matches its delegation project must fail closed with
+    /// `ScopeDrift`, never silently succeed. Catches `!=` -> `==` on the
+    /// drift comparison.
+    #[test]
+    fn credentials_scope_drift_between_token_and_delegation_project_is_rejected() {
+        let vsc = vsc_with_ctx_and_project(
+            AuthenticationContext::ApplicationCredential {
+                application_credential: make_ac("delegation_project", false),
+                token: None,
+            },
+            "other_project",
+        );
+        let err = Credentials::try_from(&vsc).unwrap_err();
+        assert!(matches!(err, PolicyError::ScopeDrift));
+    }
+
+    /// Same delegation and token project: no drift, succeeds normally.
+    #[test]
+    fn credentials_no_scope_drift_when_projects_match() {
+        let vsc = vsc_with_ctx_and_project(
+            AuthenticationContext::ApplicationCredential {
+                application_credential: make_ac("project_id", false),
+                token: None,
+            },
+            "project_id",
+        );
+        assert!(Credentials::try_from(&vsc).is_ok());
     }
 }

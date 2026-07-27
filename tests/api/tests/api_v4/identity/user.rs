@@ -328,12 +328,13 @@ async fn test_v4_user_update_unauthorized() -> Result<()> {
 #[tokio::test]
 async fn test_v4_user_delete_success_admin() -> Result<()> {
     let admin = admin_session().await?;
-    let user = create_user_v4(&admin, user_create()?).await?;
+    // `into_inner`: this test's subject *is* the delete endpoint, so the
+    // guard must not also delete (a second DELETE would 404).
+    let user = create_user_v4(&admin, user_create()?).await?.into_inner();
     let id = user.id.clone();
 
     delete_user_v4(&admin, &id).await?;
 
-    // The guard's own delete would 404 now, so it is deliberately not run.
     let rsp = raw_request(http::Method::GET, &format!("v4/users/{id}"), None, None).await?;
     assert_ne!(
         rsp.status(),

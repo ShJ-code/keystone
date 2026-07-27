@@ -24,5 +24,6 @@ mod api_v4 {
     mod role;
     mod role_assignment;
     mod scim_realm;
+    mod token_restriction;
     mod webauthn;
 }

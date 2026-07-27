@@ -16,6 +16,7 @@
 //! This suite can not be executed against python Keystone.
 
 mod api_v4 {
+    mod api_key;
     mod auth;
     mod identity;
     mod mapping;

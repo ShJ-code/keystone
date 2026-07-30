@@ -181,6 +181,13 @@ Keystone-NG treats this table as read/write but never issues DDL against it.
     the wrong target (e.g. the caller's own attributes, or a cached target from
     the first item) would make the re-check a no-op and reintroduce a variant of
     CVE-2019-19687 rather than closing it.
+  - **The first phase must still narrow the query**: an unprivileged caller
+    reaching the per-item pass with no usable filter turns one request into a
+    full-collection scan plus an OPA round-trip per row. Matching Python
+    Keystone's `identity:list_credentials`, `identity/credential/list` therefore
+    requires a `user_id` filter naming the caller unless the caller is `admin`
+    or holds `reader` on the system scope. The accepted performance implication
+    above applies only to those privileged listers.
 
 #### Delegation Project Boundary (OSSA-2026-015)
 

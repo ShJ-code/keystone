@@ -37,6 +37,10 @@ behind each item.
       Gate I)
 - [ ] New list/collection endpoint? Does it re-check each item with the
       per-item read policy? (I8)
+- [ ] Same endpoint: can an unprivileged caller request the whole collection
+      and leave the per-item pass to sort it out? Is the value the
+      collection policy gates on the same one the driver actually filters
+      by? (I8a)
 - [ ] Does the change let a narrow auth method be broadened by a
       request-supplied scope? (I5)
 - [ ] Are there negative tests proving the escape is blocked, not just

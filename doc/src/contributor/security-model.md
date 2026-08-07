@@ -279,6 +279,30 @@ cannot read (CVE-2019-19687). **Where:**
 `crates/keystone/src/api/v3/credential/list.rs`,
 `crates/keystone/src/api/v3/policy/list.rs`.
 
+### I8a — A per-item re-check does not license a permissive collection filter
+
+**What:** the collection-level policy must still narrow the query to what the
+caller could plausibly read, using filter values the driver actually applies.
+An unprivileged caller must not be able to request the whole collection and
+have the per-item pass sort it out. **Why:** I8 makes a permissive collection
+filter *safe* (nothing leaks) but not *cheap* — every row still has to be
+fetched and OPA-evaluated before being discarded, so a single request
+becomes a full-table scan plus N policy round-trips. That is a
+resource-exhaustion amplifier available to any authenticated user, which is
+what issue #1117 found in `identity/credential/list`: it granted every `member`
+an unfiltered list. It now demands a `user_id` filter naming the caller unless
+the caller is a privileged lister (`admin`, or `reader` on the system scope).
+**Where:** `policy/credential/list.rego`, paired with the
+`AUTHORIZED_PAGE_SCAN_FACTOR` bound in `collect_authorized_page`
+(`crates/keystone/src/api/common.rs`), which caps the same cost for the
+privileged listers whose rows legitimately do get filtered.
+
+> When adding a collection endpoint, check that the value the policy is
+> gating on is the *same* value the driver filters by. If the policy approves
+> `?user_id=X` but the driver ignores `user_id`, the check is decorative: the
+> scan happens anyway. In `credential/list` both read a single parsed
+> `CredentialListParameters`, so they cannot diverge.
+
 ## 5. Delegated-auth specifics
 
 Trust, application-credential, and EC2 are authentication _methods_, each with
@@ -376,6 +400,10 @@ carries it, ticked by the reviewer, not just this prose reference.
 - [ ] Does any new data reaching OPA include **secrets/decrypted blobs** (I7)?
 - [ ] New list/collection endpoint? Does it **re-check each item** with the
       per-item read policy (I8)?
+- [ ] Same endpoint: can an **unprivileged caller request the whole
+      collection** and leave the per-item pass to sort it out? Is the value
+      the collection policy gates on the same one the **driver actually
+      filters by** (I8a)?
 - [ ] Does the change let a narrow auth method be **broadened by a
       request-supplied scope** (I5)?
 - [ ] Are there **negative tests** proving the escape is blocked, not just
